@@ -20,6 +20,7 @@ class NetworkState:
     axon_refractory_timer: jnp.ndarray # Shape [N]
     dopamine_buffer: jnp.ndarray # Shape [5]
     dopamine_idx: jnp.int32
+    dominance_timer: jnp.ndarray # Shape [N] - coda a tempo di servizio finito (vedi network_step)
 
 def init_network_state(topology: NetworkTopology, max_delay: int, max_log_size: int = 1000) -> NetworkState:
     return NetworkState(
@@ -31,10 +32,11 @@ def init_network_state(topology: NetworkTopology, max_delay: int, max_log_size: 
         time_step=jnp.int32(0),
         axon_refractory_timer=jnp.zeros(topology.n_neurons, dtype=jnp.int32),
         dopamine_buffer=jnp.zeros(5, dtype=jnp.float32),
-        dopamine_idx=jnp.int32(0)
+        dopamine_idx=jnp.int32(0),
+        dominance_timer=jnp.zeros(topology.n_neurons, dtype=jnp.int32)
     )
 
-def network_step(state: NetworkState, topology: NetworkTopology, blackboard: Blackboard, external_exc: jnp.ndarray, external_inh: jnp.ndarray, disable_request: jnp.ndarray) -> Tuple[NetworkState, jnp.ndarray]:
+def network_step(state: NetworkState, topology: NetworkTopology, blackboard: Blackboard, external_exc: jnp.ndarray, external_inh: jnp.ndarray, disable_request: jnp.ndarray, external_target: jnp.ndarray = None) -> Tuple[NetworkState, jnp.ndarray]:
     """
     Singolo Scan Cycle IEC 61131-3 vettorializzato in JAX.
     """
@@ -58,13 +60,21 @@ def network_step(state: NetworkState, topology: NetworkTopology, blackboard: Bla
     new_dopamine_buffer = state.dopamine_buffer.at[next_dopamine_idx].set(blackboard.dopamine_level)
     
     new_synapses, effective_charge_matrix = synapse_step(
-        state.synapses, 
-        pre_spikes=current_spikes, 
+        state.synapses,
+        pre_spikes=current_spikes,
         post_spikes=post_spikes,
         plasticity_mask=topology.plasticity_mask,
-        dopamine=current_dopamine
+        dopamine=current_dopamine,
+        max_total_capacity=topology.max_synaptic_budget,
+        homeostatic_tau=topology.homeostatic_tau,
+        target_signal=external_target,
+        use_delta_rule=topology.use_delta_rule,
+        q_capacity=topology.delta_rule_q_capacity,
+        ki_ts=topology.delta_rule_ki_ts,
+        decay_period=topology.delta_rule_decay_period,
+        decay_quantum=topology.delta_rule_decay_quantum
     )
-    
+
     # Sovrascriviamo la topologia con i pesi aggiornati dalla sinapsi (solo per la matrice eccitatoria)
     # N.B. In futuro potremmo estendere l'apprendimento alle matrici inibitorie.
     w_exc_dynamic = new_synapses.weight
@@ -80,22 +90,54 @@ def network_step(state: NetworkState, topology: NetworkTopology, blackboard: Bla
     # i_exc_branches: [N_post, n_branches]
     i_exc_branches = jnp.sum(effective_charge_3d, axis=0)
     
-    # Aggiungiamo input esterno (assumiamo vada sul branch 0)
-    external_exc_branches = jnp.zeros_like(i_exc_branches).at[:, 0].set(external_exc)
+    # Gettone di dominanza (fatto contabile: "ho vinto entro le ultime DOMINANCE_HOLD
+    # scansioni"), usato sia per l'inibizione competitiva sotto sia per l'attenzione
+    # top-down qui sopra: e' lo stesso segnale, letto in due direzioni diverse.
+    is_dominant = state.dominance_timer > 0
+    dominant_f32 = is_dominant.astype(jnp.float32)
+
+    # Attenzione top-down: un motore dominante inietta corrente eccitatoria
+    # all'indietro sui presinaptici da cui dipende di piu' - stesso filo del peso
+    # gia' imparato (w_exc_dynamic), percorso al contrario, non una matrice nuova.
+    # Attiva solo fuori dal training (dopamina <= 0): durante l'apprendimento il
+    # teacher forcing guida gia' il motore giusto, e aggiungere qui un rinforzo
+    # rischierebbe di far saturare i pesi ancora piu' in fretta.
+    attention_active = (blackboard.dopamine_level <= 0.0).astype(jnp.float32)
+    attention_current = topology.attention_gain * attention_active * jnp.dot(w_exc_dynamic, dominant_f32)
+
+    # Aggiungiamo input esterno (assumiamo vada sul branch 0) e l'eventuale
+    # rinforzo top-down (stesso branch: e' comunque corrente eccitatoria in ingresso)
+    external_exc_branches = jnp.zeros_like(i_exc_branches).at[:, 0].add(external_exc + attention_current)
     total_i_exc = i_exc_branches + external_exc_branches
-    
+
     # Per inibitorio e shunting, usiamo i pesi statici (niente STP/Covarianza per ora)
-    spike_f32 = current_spikes.astype(jnp.float32)
-    total_i_inh = jnp.dot(spike_f32, topology.w_inh) + external_inh
-    total_i_shunt = jnp.dot(spike_f32, topology.w_shunt)
-    
+    # Inibizione competitiva pilotata dal GETTONE DI DOMINANZA (fatto contabile:
+    # "ho vinto entro le ultime DOMINANCE_HOLD scansioni"), non dallo spike istantaneo.
+    # Lo spike grezzo dura 1 solo ciclo: usarlo direttamente come sorgente di inibizione
+    # produce un carosello a rotazione (il vincitore va in refrattario, l'inibizione
+    # sparisce con lui, il prossimo in classifica ha via libera). Il gettone e' una coda
+    # a tempo di servizio finito, esattamente come axon_refractory_timer: si ricarica al
+    # valore pieno a ogni evento di vittoria, scarica di 1 a ogni ciclo, ed e' "vero" finche'
+    # non si esaurisce - un fatto contabile discreto, non un confronto su un livello continuo.
+    #
+    # Tutta la rete legge qui lo stesso stato congelato di 'state' (dalla fine del ciclo
+    # precedente) e scrive in 'new_neurons', un oggetto nuovo, mai in-place - esattamente
+    # come InputSignalUpdate->Main->OutputSignalUpdate nel vero PLC: ingressi congelati per
+    # l'intero scan, commit unico a fine ciclo. L'ordine (qui: nessun ordine, e' un'unica
+    # operazione vettorializzata) non conta perche' nessun neurone vede aggiornamenti "in
+    # corso" di un altro entro lo stesso ciclo - se piu' neuroni pareggiano, e' un sintomo
+    # onesto di pesi non ancora sufficientemente differenziati, non un difetto da mascherare
+    # con un ordine di esecuzione arbitrario.
+    total_i_inh = jnp.dot(dominant_f32, topology.w_inh) + external_inh
+    total_i_shunt = jnp.dot(dominant_f32, topology.w_shunt)
+
     # 4. Aggiornamento Neuroni
     # vmap trasforma una funzione operante su 1 neurone in una operante su N neuroni
-    # siccome neuron_step prende intere ndarray e fa math globale (perchè l'abbiamo scritta così in Neuron.py), 
+    # siccome neuron_step prende intere ndarray e fa math globale (perchè l'abbiamo scritta così in Neuron.py),
     # non serve neanche vmap! neuron_step usa GIA' le shape [N].
-    
+
     new_neurons = neuron_step(state.neurons, total_i_exc, total_i_inh, total_i_shunt, disable_request)
-    
+
     # 4. Aggiornamento Axon Delay Buffer
     new_spikes = new_neurons.actuator.enable
     
@@ -106,7 +148,23 @@ def network_step(state: NetworkState, topology: NetworkTopology, blackboard: Bla
     
     # Aggiornamento timer refrattario assonale: se c'è spike effettivo imposta a 2, altrimenti decrementa
     new_axon_timer = jnp.where(effective_spikes, 2, jnp.maximum(0, state.axon_refractory_timer - 1))
-    
+
+    # Aggiornamento del gettone di dominanza: la ricarica NON e' un valore fisso uguale
+    # per ogni vincitore, altrimenti l'intera coorte di chi supera la soglia quasi insieme
+    # si inibirebbe a vicenda e scadrebbe tutta insieme (carosello piu' lento, ma sempre
+    # carosello). La ricarica e' 1 ciclo garantito per qualunque vittoria (altrimenti un
+    # margine di sovrasoglia sotto un quanto arrotonderebbe a zero, come infatti accadeva:
+    # il tetto configurato non aveva alcun effetto sui vincitori marginali) PIU' un margine
+    # aggiuntivo proporzionale a QUANTI pacchetti di sovrasoglia il neurone ha accumulato al
+    # momento della vittoria (stessa convenzione a pacchetti gia' usata per il canale
+    # sinaptico in Synapse.py - un fatto contabile, non una formula continua), con tetto a
+    # topology.dominance_hold (la capacita' finita della coda). Con dominance_hold=1
+    # (default) il tetto riporta sempre a 1: nessun cambiamento per chi non lo configura.
+    DOMINANCE_QUANTUM = 100.0
+    surplus_packets = jnp.maximum(0.0, new_neurons.dendrite.accumulator - 1000.0) / DOMINANCE_QUANTUM
+    token_gain = jnp.minimum(topology.dominance_hold, 1 + surplus_packets.astype(jnp.int32))
+    new_dominance_timer = jnp.where(effective_spikes, jnp.maximum(state.dominance_timer, token_gain), jnp.maximum(0, state.dominance_timer - 1))
+
     max_delay = state.spike_buffer.shape[0]
     next_idx = (state.buffer_idx + 1) % max_delay
     
@@ -128,23 +186,29 @@ def network_step(state: NetworkState, topology: NetworkTopology, blackboard: Bla
         time_step=state.time_step + 1,
         axon_refractory_timer=new_axon_timer,
         dopamine_buffer=new_dopamine_buffer,
-        dopamine_idx=next_dopamine_idx
+        dopamine_idx=next_dopamine_idx,
+        dominance_timer=new_dominance_timer
     )
     
     return new_state, effective_spikes
 
-def run_network_scan(initial_state: NetworkState, topology: NetworkTopology, blackboard: Blackboard, ext_exc_seq: jnp.ndarray, ext_inh_seq: jnp.ndarray, disable_seq: jnp.ndarray):
+def run_network_scan(initial_state: NetworkState, topology: NetworkTopology, blackboard: Blackboard, ext_exc_seq: jnp.ndarray, ext_inh_seq: jnp.ndarray, disable_seq: jnp.ndarray, ext_target_seq: jnp.ndarray = None):
     """
     Esegue M scansioni della rete.
     ext_exc_seq ha shape [M, N]
     Restituisce (stato_finale, spike_history [M, N])
     """
+    if ext_target_seq is None:
+        # Nessun bersaglio esterno fornito: la regola delta locale (se mai attiva
+        # per questa topologia) non riceve mai un evento "bersaglio attivo".
+        ext_target_seq = jnp.zeros_like(ext_exc_seq, dtype=jnp.bool_)
+
     def scan_fn(state, inputs):
-        ext_exc, ext_inh, disable = inputs
-        new_state, out_spikes = network_step(state, topology, blackboard, ext_exc, ext_inh, disable)
+        ext_exc, ext_inh, disable, ext_target = inputs
+        new_state, out_spikes = network_step(state, topology, blackboard, ext_exc, ext_inh, disable, ext_target)
         return new_state, out_spikes
-    
-    final_state, spike_history = jax.lax.scan(scan_fn, initial_state, (ext_exc_seq, ext_inh_seq, disable_seq))
+
+    final_state, spike_history = jax.lax.scan(scan_fn, initial_state, (ext_exc_seq, ext_inh_seq, disable_seq, ext_target_seq))
     return final_state, spike_history
 
 def replay_log(state: NetworkState, topology: NetworkTopology, blackboard: Blackboard) -> NetworkState:
@@ -169,7 +233,9 @@ def replay_log(state: NetworkState, topology: NetworkTopology, blackboard: Black
             pre_spikes=pre,
             post_spikes=post,
             plasticity_mask=topology.plasticity_mask,
-            dopamine=blackboard.dopamine_level
+            dopamine=blackboard.dopamine_level,
+            max_total_capacity=topology.max_synaptic_budget,
+            homeostatic_tau=topology.homeostatic_tau
         )
         return new_syn_state, None
         

@@ -26,7 +26,8 @@ def reset_neuron_dynamics(state):
         buffer_idx=jnp.int32(0),
         axon_refractory_timer=jnp.zeros_like(state.axon_refractory_timer),
         dopamine_buffer=jnp.zeros_like(state.dopamine_buffer),
-        dopamine_idx=jnp.int32(0)
+        dopamine_idx=jnp.int32(0),
+        dominance_timer=jnp.zeros_like(state.dominance_timer)
     )
 
 def test_mnist_snn():
