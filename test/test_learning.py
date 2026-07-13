@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import jax
 import jax.numpy as jnp
 try:
@@ -7,7 +11,6 @@ try:
     HAVE_PLT = True
 except ImportError:
     HAVE_PLT = False
-import os
 
 from moqui_nn.NNFacade import create_topology
 from moqui_nn.DeviceManager import init_network_state, run_network_scan, replay_log

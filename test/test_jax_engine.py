@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import jax
 import jax.numpy as jnp
 try:
@@ -7,7 +11,6 @@ try:
     HAVE_PLT = True
 except ImportError:
     HAVE_PLT = False
-import os
 
 from moqui_nn.Constants import *
 from moqui_nn.Neuron import init_neuron_state, neuron_step
