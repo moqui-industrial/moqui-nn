@@ -115,6 +115,13 @@ def test_mnist_reservoir():
     # debolmente eccitato, finisce per superare la soglia.
     PULSE_DURATION = 5
 
+    # Guadagno del pixel: con 300 (valore originale) un pixel al massimo supera
+    # appena la soglia all'ultimo ciclo utile dell'impulso - zero margine
+    # temporale perche' la competizione centro-periferia tra sensori vicini
+    # (sotto) abbia la possibilita' di agire prima che l'impulso finisca.
+    # Alzato per lasciare cicli di margine reale alla competizione.
+    PIXEL_GAIN = 600.0
+
     # Convergenza sensori->hidden: il dato anatomico reale (Caron et al. 2013,
     # cellule di Kenyon nella Drosophila) e' che ogni cellula di espansione
     # riceve input da SOLO ~6-7 neuroni di proiezione su circa 50 disponibili
@@ -124,11 +131,36 @@ def test_mnist_reservoir():
     # rilevatore, e un guadagno per filo abbastanza basso che nessuno da solo basti.
     K_CONVERGENCE = 6
 
+    # Inibizione centro-periferia tra i sensori (griglia 8x8 dei pixel, dataset
+    # sklearn digits): un cablaggio casuale separa bene le classi solo se i
+    # canali d'ingresso sono gia' approssimativamente indipendenti tra loro. I
+    # pixel grezzi non lo sono (regioni vicine correlate) - manca lo stadio che
+    # nella retina reale decorrela l'ingresso PRIMA dell'espansione casuale.
+    # Stesso canale w_inh gia' usato altrove, cablato stavolta tra vicini fisici
+    # sulla griglia dell'immagine invece che tra neuroni hidden o motori: ogni
+    # sensore inibisce i propri vicini (su/giu/sinistra/destra), cosi' una
+    # regione uniformemente accesa (l'interno di un tratto) si sopprime a
+    # vicenda, e sopravvive solo il contrasto locale (i bordi) - esattamente il
+    # calcolo delle cellule orizzontali retiniche.
+    SURROUND_GAIN = 2000.0
+    GRID_SIDE = 8  # sklearn digits: immagini 8x8 = 64 pixel
+
     rng = np.random.default_rng(123)
 
     w_exc_np = np.zeros((N, N), dtype=np.float32)
     w_inh_np = np.zeros((N, N), dtype=np.float32)
     plasticity_np = np.zeros((N, N), dtype=bool)
+
+    # -------------------------------------------------------------
+    # 0. Inibizione Laterale Centro-Periferia tra i Sensori (Decorrelazione)
+    # -------------------------------------------------------------
+    for idx in range(N_SENSORS):
+        r, c = divmod(idx, GRID_SIDE)
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < GRID_SIDE and 0 <= cc < GRID_SIDE:
+                neighbor_idx = rr * GRID_SIDE + cc
+                w_inh_np[neighbor_idx, idx] = SURROUND_GAIN
 
     # -------------------------------------------------------------
     # 1. Connessioni Fisse: Sensori -> Interneuroni (Il Reservoir)
@@ -220,7 +252,7 @@ def test_mnist_reservoir():
             label = y_train[idx]
 
             ext_exc = jnp.zeros((SCANS_PER_IMAGE, N))
-            ext_exc = ext_exc.at[:PULSE_DURATION, :N_SENSORS].set(pixels * 300.0)
+            ext_exc = ext_exc.at[:PULSE_DURATION, :N_SENSORS].set(pixels * PIXEL_GAIN)
 
             motor_idx = MOT_LO + label
             ext_exc = ext_exc.at[:, motor_idx].set(800.0)
@@ -274,7 +306,7 @@ def test_mnist_reservoir():
         label = y_test[idx]
 
         ext_exc = jnp.zeros((TEST_SCANS, N))
-        ext_exc = ext_exc.at[:PULSE_DURATION, :N_SENSORS].set(pixels * 300.0)
+        ext_exc = ext_exc.at[:PULSE_DURATION, :N_SENSORS].set(pixels * PIXEL_GAIN)
 
         ext_inh = jnp.zeros((TEST_SCANS, N))
         disable = jnp.zeros((TEST_SCANS, N), dtype=jnp.bool_)
