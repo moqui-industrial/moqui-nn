@@ -38,6 +38,12 @@ class NetworkTopology:
     # convergono), quindi e' un parametro di topologia, non una costante fissa.
     max_synaptic_budget: float = struct.field(pytree_node=False, default=55.0)
 
+    # Budget di normalizzazione eterosinaptica PRESINAPTICA: quanto peso totale
+    # puo' distribuire in uscita un singolo sensore verso tutti i post-sinaptici
+    # insieme (competizione per una risorsa presinaptica finita, complementare
+    # a max_synaptic_budget). Un valore molto grande (default) = no-op.
+    max_presynaptic_capacity: float = struct.field(pytree_node=False, default=1e6)
+
     # Scala temporale dello scaling omeostatico (vedi Synapse.py synapse_step).
     # 1.0 (default) = correzione istantanea e completa a ogni ciclo, identico al
     # comportamento originale. Valori piu' alti rendono il riequilibrio graduale
@@ -70,7 +76,7 @@ class NetworkTopology:
 def create_topology(n_neurons: int, n_branches: int, max_synaptic_budget: float = 55.0, homeostatic_tau: float = 1.0,
                      use_delta_rule: bool = False, delta_rule_ki_ts: float = 1.0, delta_rule_q_capacity: float = 10.0,
                      delta_rule_decay_period: int = 50, delta_rule_decay_quantum: float = 0.0,
-                     attention_gain: float = 0.0) -> NetworkTopology:
+                     max_presynaptic_capacity: float = 1e6, attention_gain: float = 0.0) -> NetworkTopology:
     return NetworkTopology(
         n_neurons=n_neurons,
         n_branches=n_branches,
@@ -82,6 +88,7 @@ def create_topology(n_neurons: int, n_branches: int, max_synaptic_budget: float 
         plasticity_mask=jnp.zeros((n_neurons, n_neurons), dtype=jnp.bool_),
         dominance_hold=jnp.ones(n_neurons, dtype=jnp.int32),
         max_synaptic_budget=max_synaptic_budget,
+        max_presynaptic_capacity=max_presynaptic_capacity,
         homeostatic_tau=homeostatic_tau,
         use_delta_rule=use_delta_rule,
         delta_rule_ki_ts=delta_rule_ki_ts,

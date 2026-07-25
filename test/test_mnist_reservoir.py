@@ -85,9 +85,17 @@ def test_mnist_reservoir():
     # Stagionatura per-sinapsi: dopo quanti cicli senza un evento di rinforzo/
     # punizione su quella specifica connessione si scarica un pacchetto fisso di
     # peso. Intervallo delimitato empiricamente: 300->10/10 pareggiati, 100->9/10,
-    # 30->5/10, 2->1/10 ma sbagliato. Trend monotono, restringo tra 2 e 30.
-    DELTA_RULE_DECAY_PERIOD = 10
+    # 30->5/10, 2->1/10 ma sbagliato (schiaccia anche il segnale corretto).
+    # Torniamo al valore piu' mite (30): la specializzazione la fa ora soprattutto
+    # il budget presinaptico qui sotto, non un decadimento aggressivo.
+    DELTA_RULE_DECAY_PERIOD = 30
     DELTA_RULE_DECAY_QUANTUM = 1.0
+
+    # Budget presinaptico: quanto peso totale puo' distribuire in uscita un
+    # singolo sensore verso TUTTI i motori insieme. Misurato empiricamente su
+    # un training parziale: con 25 la soglia non vincolava quasi nessuno
+    # (p90=10.3, p99=15.4 dopo 300 immagini) - la restringo a 12.
+    MAX_PRESYNAPTIC_CAPACITY = 12.0
 
     # Tempo di mantenimento del gettone di dominanza per i neuroni hidden: quanti
     # cicli resta valido il fatto "ho vinto", oltre il proprio refrattario. Con 1
@@ -180,7 +188,8 @@ def test_mnist_reservoir():
 
     topo = create_topology(N, BRANCHES, max_synaptic_budget=SYNAPTIC_BUDGET, use_delta_rule=True,
                             delta_rule_decay_period=DELTA_RULE_DECAY_PERIOD,
-                            delta_rule_decay_quantum=DELTA_RULE_DECAY_QUANTUM, attention_gain=ATTENTION_GAIN)
+                            delta_rule_decay_quantum=DELTA_RULE_DECAY_QUANTUM,
+                            max_presynaptic_capacity=MAX_PRESYNAPTIC_CAPACITY, attention_gain=ATTENTION_GAIN)
     topo = topo.replace(
         w_exc=jnp.array(w_exc_np),
         w_inh=jnp.array(w_inh_np),

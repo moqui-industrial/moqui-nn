@@ -66,6 +66,7 @@ def network_step(state: NetworkState, topology: NetworkTopology, blackboard: Bla
         plasticity_mask=topology.plasticity_mask,
         dopamine=current_dopamine,
         max_total_capacity=topology.max_synaptic_budget,
+        max_presynaptic_capacity=topology.max_presynaptic_capacity,
         homeostatic_tau=topology.homeostatic_tau,
         target_signal=external_target,
         use_delta_rule=topology.use_delta_rule,

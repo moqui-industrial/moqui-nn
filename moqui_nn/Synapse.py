@@ -65,7 +65,8 @@ def synapse_step(
     homeostatic_tau: float = 1.0,
     target_signal: jnp.ndarray = None, use_delta_rule: bool = False,
     q_capacity: float = 10.0, ki_ts: float = 1.0,
-    decay_period: int = 50, decay_quantum: float = 0.0
+    decay_period: int = 50, decay_quantum: float = 0.0,
+    max_presynaptic_capacity: float = 1e6
 ) -> Tuple[SynapseState, jnp.ndarray]:
     """
     Esegue STP e Covarianza per tutte le connessioni NxN.
@@ -212,7 +213,24 @@ def synapse_step(
     scale = 1.0 + (target_scale - 1.0) / homeostatic_tau
     # Riscaliamo solo i collegamenti plastici
     new_weight = jnp.where(plasticity_mask, new_weight * scale, new_weight)
-    
+
+    # ---------------------------------------------------------
+    # Normalizzazione Eterosinaptica PRESINAPTICA (competizione per le risorse
+    # in uscita di ogni singolo sensore, complementare a quella sopra)
+    # ---------------------------------------------------------
+    # Il budget sopra limita QUANTO ARRIVA a un motore; questo limita QUANTO
+    # ESCE da un singolo sensore verso TUTTI i motori insieme. Senza questo, un
+    # sensore generico (si attiva per molte classi) puo' accumulare un po' di
+    # peso verso 6-7 motori diversi senza mai doverne scegliere uno - con il
+    # budget in uscita e' costretto a concentrare il proprio peso su pochi
+    # selettori, una vera competizione per una risorsa presinaptica finita
+    # (analoga alla capacita' limitata di vescicole/recettori di un singolo
+    # assone). max_presynaptic_capacity molto grande (default) = no-op.
+    total_outgoing_plastic = jnp.sum(jnp.where(plasticity_mask, new_weight, 0.0), axis=1, keepdims=True)
+    target_scale_out = jnp.minimum(1.0, max_presynaptic_capacity / (total_outgoing_plastic + 1e-5))
+    scale_out = 1.0 + (target_scale_out - 1.0) / homeostatic_tau
+    new_weight = jnp.where(plasticity_mask, new_weight * scale_out, new_weight)
+
     new_state = SynapseState(
         weight=new_weight,
         R=new_R,
